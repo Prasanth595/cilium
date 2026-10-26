@@ -40,6 +40,36 @@ func setupCTMap(tb testing.TB) {
 	require.NoError(tb, err)
 }
 
+// newTestCtMap4 opens a global TCP4 CT map that is removed when the test ends.
+func newTestCtMap4(tb testing.TB) *Map {
+	tb.Helper()
+	setupCTMap(tb)
+
+	m := newMap(MapNameTCP4Global+"_test", mapTypeIPv4TCPGlobal)
+	require.NoError(tb, m.OpenOrCreate())
+	tb.Cleanup(func() {
+		assert.NoError(tb, m.Map.Unpin())
+		assert.NoError(tb, m.Map.Close())
+	})
+	return m
+}
+
+// newTestCtKey4 returns a TCP OUT key, with the ports used by the other GC tests.
+func newTestCtKey4(src, dst types.IPv4) *CtKey4Global {
+	return &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				SourceAddr: src,
+				DestAddr:   dst,
+				SourcePort: 0x3195,
+				DestPort:   0x50,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+}
+
 func BenchmarkMapBatchLookup(b *testing.B) {
 	m := newMap(MapNameTCP4Global+"_test", mapTypeIPv4TCPGlobal)
 	err := m.OpenOrCreate()
@@ -438,8 +468,9 @@ func TestPrivilegedCtGcReopenedEntry(t *testing.T) {
 	})
 
 	t.Run("entry matched by IP is deleted regardless of Lifetime", func(t *testing.T) {
-		// scrubIPsInConntrackTableLocked() selects on IPs only, so a Lifetime
-		// refreshed past expiry after the batch read must not defer the delete.
+		// A filter that selects on IPs, like the endpoint scrub's, deletes
+		// regardless of Lifetime: a Lifetime refreshed past expiry after the
+		// batch read must not defer the delete.
 		err := ctMap.Map.Update(key, &CtEntry{Packets: 5, Bytes: 600, Lifetime: 50000})
 		require.NoError(t, err)
 
@@ -513,6 +544,36 @@ func TestPrivilegedCtGcReopenedEntry(t *testing.T) {
 		require.Equal(t, uint32(0), stats.aliveEntries)
 		require.Equal(t, uint32(0), stats.deleted)
 	})
+}
+
+// TestPrivilegedCtGcScrubRemovesExpired checks that the filter used by the
+// endpoint scrub deletes expired entries along with the ones matching its IPs.
+func TestPrivilegedCtGcScrubRemovesExpired(t *testing.T) {
+	ctMap := newTestCtMap4(t)
+
+	expired := newTestCtKey4(types.IPv4{10, 0, 0, 2}, types.IPv4{10, 0, 0, 1})
+	liveMatching := newTestCtKey4(types.IPv4{192, 168, 61, 12}, types.IPv4{192, 168, 61, 11})
+	liveOther := newTestCtKey4(types.IPv4{10, 0, 1, 2}, types.IPv4{10, 0, 1, 1})
+	require.NoError(t, ctMap.Map.Update(expired, &CtEntry{Lifetime: 0}))
+	require.NoError(t, ctMap.Map.Update(liveMatching, &CtEntry{Lifetime: MaxTime}))
+	require.NoError(t, ctMap.Map.Update(liveOther, &CtEntry{Lifetime: MaxTime}))
+
+	noop := func(GCEvent) {}
+	deleted, err := ctMap.GC(GCFilter{
+		RemoveExpired: true,
+		MatchIPs: map[NetAddr]struct{}{
+			{Addr: netip.MustParseAddr("192.168.61.11")}: {},
+		},
+	}, noop, noop)
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+
+	_, err = ctMap.Map.Lookup(expired)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "expired entry must be deleted")
+	_, err = ctMap.Map.Lookup(liveMatching)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "entry matching the IPs must be deleted")
+	_, err = ctMap.Map.Lookup(liveOther)
+	require.NoError(t, err, "live entry not matching the IPs must survive")
 }
 
 // TestPrivilegedCtGcDsr tests whether DSR NAT entries are removed upon a removal of
