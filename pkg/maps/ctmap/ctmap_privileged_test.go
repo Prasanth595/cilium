@@ -5,9 +5,12 @@ package ctmap
 
 import (
 	"context"
+	"log/slog"
 	"math/rand/v2"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -18,7 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/maps/nat"
+	"github.com/cilium/cilium/pkg/maps/timestamp"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/testutils"
 	"github.com/cilium/cilium/pkg/tuple"
@@ -574,6 +579,69 @@ func TestPrivilegedCtGcScrubRemovesExpired(t *testing.T) {
 	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "entry matching the IPs must be deleted")
 	_, err = ctMap.Map.Lookup(liveOther)
 	require.NoError(t, err, "live entry not matching the IPs must survive")
+}
+
+// TestPrivilegedCtGcCutoffAfterLock checks that the expiry cutoff is taken
+// once the GC holds the delete lock, not when it was requested: an entry that
+// expires while the GC is queued behind another delete must still be deleted.
+func TestPrivilegedCtGcCutoffAfterLock(t *testing.T) {
+	ctMap := newTestCtMap4(t)
+	noop := func(GCEvent) {}
+
+	// lockdebug panics on a nil logger in printStackTo (it still writes a
+	// stack trace to stderr after locks held >100ms). lock has no getter, so
+	// the cleanup resets to nil, assuming nothing else installed one.
+	lock.SetLogger(slog.New(slog.DiscardHandler))
+	t.Cleanup(func() { lock.SetLogger(nil) })
+
+	deleteLock := &globalDeleteLock[mapTypeIPv4TCPGlobal]
+	deleteLock.Lock()
+	unlock := sync.OnceFunc(deleteLock.UnlockIgnoreTime)
+
+	var wg sync.WaitGroup
+	var gcErr error
+	wg.Go(func() {
+		_, gcErr = ctMap.GC(GCFilter{RemoveExpired: true}, noop, noop)
+	})
+	// Release the lock on any exit and wait for the GC, so a failed run does
+	// not leave it blocked or running against a closed map.
+	t.Cleanup(func() {
+		unlock()
+		wg.Wait()
+	})
+
+	// The GC holds natMapLock once it is queued on the delete lock. The probe
+	// must run in a goroutine holding no locks (Eventually's does; under
+	// lockdebug go-deadlock would exit otherwise). Seed only after it
+	// succeeds: a GC that stamped its cutoff on entry would see the entry as
+	// live, and the test would fail.
+	natMapLock := mapInfo[mapTypeIPv4TCPGlobal].natMapLock
+	require.Eventually(t, func() bool {
+		if natMapLock.TryLock() {
+			natMapLock.UnlockIgnoreTime()
+			return false
+		}
+		return true
+	}, 20*time.Second, 10*time.Millisecond, "GC did not reach the delete lock")
+
+	now, err := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
+	require.NoError(t, err)
+	key := newTestCtKey4(types.IPv4{10, 0, 0, 2}, types.IPv4{10, 0, 0, 1})
+	require.NoError(t, ctMap.Map.Update(key, &CtEntry{Lifetime: uint32(now)}))
+
+	// Wait until the CT clock has moved past the entry's lifetime. The clock
+	// ticks at a rate set by the clock source (jiffies are scaled).
+	require.Eventually(t, func() bool {
+		cur, err := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
+		return err == nil && cur > now
+	}, 20*time.Second, 100*time.Millisecond, "CT clock did not advance")
+
+	unlock()
+	wg.Wait()
+	require.NoError(t, gcErr)
+
+	_, err = ctMap.Map.Lookup(key)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "entry that expired while the GC was queued must be deleted")
 }
 
 // TestPrivilegedCtGcDsr tests whether DSR NAT entries are removed upon a removal of
