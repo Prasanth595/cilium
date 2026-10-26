@@ -295,6 +295,7 @@ crt
 crypto
 cryptographic
 ctf
+ctstate
 customConf
 daemonset
 datacenter
@@ -336,6 +337,7 @@ dnsProxy
 dockerd
 dockerhub
 dpaa
+dport
 dropdown
 dryRun
 durations
